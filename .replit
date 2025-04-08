@@ -1,4 +1,4 @@
-modules = ["go"]
+modules = ["go", "golang-1.22"]
 
 [nix]
 channel = "stable-24_05"
@@ -31,7 +31,7 @@ task = "packager.installForAll"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "go run main.go -h"
+args = "./goflood -h"
 
 [[workflows.workflow]]
 name = "go_test"
@@ -48,4 +48,4 @@ task = "shell.exec"
 args = "go run main.go -h"
 
 [deployment]
-run = ["sh", "-c", "go run main.go -h"]
+run = ["sh", "-c", "./goflood -h"]
